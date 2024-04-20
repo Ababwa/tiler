@@ -1,7 +1,7 @@
 mod tile;
 mod frame_buffer;
 
-use std::{env::args, fs, mem::{replace, swap}, path::{Path, PathBuf}};
+use std::{env::args, fmt::Debug, fs, mem::{replace, swap}, path::{Path, PathBuf}};
 use anyhow::anyhow;
 use frame_buffer::FrameBuffer;
 use glam::{dvec2, ivec2, uvec2, vec2, IVec2, UVec2};
@@ -44,7 +44,7 @@ fn unique(tiles: &[Tile], images: &[RgbaImage], tile_size: UVec2, new_tile: &Sub
 			if image.view(tile_pos.x, tile_pos.y, tile_size.x, tile_size.y)
 				.pixels()
 				.zip(new_tile.pixels())
-				.any(|((_, _, a), (_, _, b))| a != b) {
+				.all(|((_, _, a), (_, _, b))| a == b) {
 				return false;
 			}
 		}
@@ -91,10 +91,12 @@ fn read_image<P: AsRef<Path>>(tile_size: UVec2, path: P) -> anyhow::Result<RgbaI
 	}
 }
 
-fn open<P: AsRef<Path>>(window: &Window, tiles: &mut Vec<Tile>, images: &mut Vec<RgbaImage>, columns: &mut u32, tile_size: UVec2, path: P) {
+fn open<P: AsRef<Path> + Debug>(window: &Window, tiles: &mut Vec<Tile>, images: &mut Vec<RgbaImage>, columns: &mut u32, tile_size: UVec2, path: P) {
 	match read_image(tile_size, &path) {
 		Ok(image) => {
-			tiles.extend(get_tiles(tiles, images, tile_size, &image));
+			let new_tiles = get_tiles(tiles, images, tile_size, &image);
+			println!("{} tiles from {:?}", new_tiles.len(), path);
+			tiles.extend(new_tiles);
 			if images.is_empty() {
 				*columns = image.width() / tile_size.x;
 			}
