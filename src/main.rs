@@ -1,436 +1,793 @@
-mod tile;
-mod frame_buffer;
+mod ext;
+mod gui;
+mod make;
+mod rect;
 
-use std::{env::args, fmt::Debug, fs, mem::{replace, swap}, path::{Path, PathBuf}};
-use anyhow::anyhow;
-use frame_buffer::FrameBuffer;
-use glam::{dvec2, ivec2, uvec2, vec2, IVec2, UVec2};
-use image::{GenericImage, GenericImageView, Rgba, RgbaImage, SubImage};
-use rfd::{FileDialog, MessageDialog};
-use softbuffer::{Context, Surface};
-use tile::{Tile, TileData};
-use winit::{
-	dpi::{PhysicalPosition, PhysicalSize},
-	event::{ElementState, Event, KeyEvent, MouseScrollDelta, WindowEvent},
-	event_loop::EventLoop,
-	keyboard::{KeyCode, ModifiersState, PhysicalKey},
-	window::{Window, WindowBuilder},
+use std::ops::RangeInclusive;
+use egui_file_dialog::FileDialog;
+use glam::{ivec2, uvec2, vec2, DVec2, IVec2, UVec2};
+use image::{GenericImageView, Rgba, RgbaImage, SubImage};
+use make::{BufferVal, PipelineAndLayout};
+use rect::RectIter;
+use wgpu::{
+	BindGroup, BindGroupLayout, BindingResource, Buffer, BufferUsages, CommandEncoder, Device,
+	Queue, ShaderStages, TextureView, TextureViewDimension,
 };
+use winit::{
+	event::{ElementState, MouseButton, MouseScrollDelta},
+	keyboard::{KeyCode, ModifiersState},
+	event_loop::EventLoopWindowTarget,
+};
+use gui::Gui;
+use ext::{AsBytes, PixelsOnly, Size, ToVec};
 
+const MAX_TILES: usize = 1024;
+const NULL_TILE: u16 = u16::MAX;
 const DEFAULT_TILE_SIZE: u32 = 64;
-const DEFAULT_COLUMNS: u32 = 4;
-const DEFAULT_OFFSET: IVec2 = ivec2(0, 2);
-const DEFAULT_BOX: UVec2 = UVec2::splat(1);
+const SQUARE: [[u16; 2]; 4] = [[0, 0], [1, 0], [0, 1], [1, 1]];
+const SQUARE_VERTS: u32 = SQUARE.len() as u32;
+const WRITABLE_UNIFORM: BufferUsages = BufferUsages::UNIFORM.union(BufferUsages::COPY_DST);
 
-fn to_vec(v: PhysicalSize<u32>) -> UVec2 {
-	uvec2(v.width, v.height)
+fn window<R>(ctx: &egui::Context, title: &str, contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+	egui::Window::new(title)
+		.collapsible(false)
+		.resizable(false)
+		.show(ctx, contents)
+		.unwrap()
+		.inner
+		.unwrap()
 }
 
-fn grid_pos(columns: u32, index: u32) -> UVec2 {
-	uvec2(index % columns, index / columns)
+struct ColumnsDialog {
+	new_columns: u32,
+	pad: bool,
 }
 
-fn resize(surface: &mut Surface<&Window, &Window>, window_size: PhysicalSize<u32>) {
-	let width = window_size.width.try_into().unwrap();
-	let height = window_size.height.try_into().unwrap();
-	surface.resize(width, height).expect("resize surface");
+struct Split {
+	image: RgbaImage,
+	grid_size: BufferVal<UVec2>,
+	grid_offset: BufferVal<UVec2>,
+	gap: BufferVal<UVec2>,
+	split_bind_group: BindGroup,
 }
 
-fn unique(tiles: &[Tile], images: &[RgbaImage], tile_size: UVec2, new_tile: &SubImage<&RgbaImage>) -> bool {
-	for tile in tiles {
-		if let Some(TileData { image_index, tile_index }) = tile.get() {
-			let image = &images[image_index];
-			let tile_pos = grid_pos(image.width() / tile_size.x, tile_index) * tile_size;
-			if image.view(tile_pos.x, tile_pos.y, tile_size.x, tile_size.y)
-				.pixels()
-				.zip(new_tile.pixels())
-				.all(|((_, _, a), (_, _, b))| a == b) {
-				return false;
-			}
-		}
-	}
-	true
+struct Tiles {
+	pixels: Vec<Rgba<u8>>,
+	columns: BufferVal<u32>,
+	select_pos1: BufferVal<UVec2>,
+	select_pos2: BufferVal<UVec2>,
+	num_tiles: BufferVal<u32>,
+	tiles: BufferVal<Box<[u16; MAX_TILES]>>,
+	pulled_tiles: BufferVal<Box<[u16; MAX_TILES]>>,
+	pulled_size: BufferVal<UVec2>,
+	tiles_bind_group: BindGroup,
+	select_bind_group: BindGroup,
+	pulled_bind_group: BindGroup,
+	columns_dialog: Option<ColumnsDialog>,
 }
 
-fn get_tiles(tiles: &[Tile], images: &[RgbaImage], tile_size: UVec2, new_image: &RgbaImage) -> Vec<Tile> {
-	let new_image_grid = UVec2::from(new_image.dimensions()) / tile_size;
-	let mut new_tiles = vec![];
-	for new_tile_index in 0..new_image_grid.element_product() {
-		let src_pos = grid_pos(new_image_grid.x, new_tile_index) * tile_size;
-		let new_tile = new_image.view(src_pos.x, src_pos.y, tile_size.x, tile_size.y);
-		let first_pixel = new_tile.get_pixel(0, 0);
-		if new_tile.pixels().any(|(_, _, pixel)| pixel != first_pixel)
-		&& new_tile.pixels().any(|(_, _, Rgba([.., a]))| a != 0)
-		&& unique(tiles, images, tile_size, &new_tile) {
-			new_tiles.push(Tile::new(images.len(), new_tile_index));
-		}
-	}
-	new_tiles
-}
+const ROTATE_CW: usize = 0;
+const ROTATE_CCW: usize = 1;
 
-struct Keys([bool; 256]);
-
-impl Keys {
-	fn new() -> Self {
-		Self([false; 256])
+impl Tiles {
+	fn index(&self, pos: UVec2) -> usize {
+		(pos.y * self.columns.val + pos.x) as usize
 	}
 	
-	fn just_pressed(&mut self, key: KeyCode, state: ElementState) -> bool {
-		let jp = state.is_pressed() && !self.0[key as u8 as usize];
-		self.0[key as u8 as usize] = state.is_pressed();
-		jp
+	fn tile_unchecked(&mut self, pos: UVec2) -> &mut u16 {
+		&mut self.tiles.val[self.index(pos)]
 	}
-}
-
-fn read_image<P: AsRef<Path>>(tile_size: UVec2, path: P) -> anyhow::Result<RgbaImage> {
-	let image = image::io::Reader::open(path)?.decode()?.into_rgba8();
-	if tile_size.cmple(image.dimensions().into()).all() {
-		Ok(image)
-	} else {
-		Err(anyhow!("Image smaller than tile size"))
-	}
-}
-
-fn open<P: AsRef<Path> + Debug>(window: &Window, tiles: &mut Vec<Tile>, images: &mut Vec<RgbaImage>, columns: &mut u32, tile_size: UVec2, path: P) {
-	match read_image(tile_size, &path) {
-		Ok(image) => {
-			let new_tiles = get_tiles(tiles, images, tile_size, &image);
-			println!("{} tiles from {:?}", new_tiles.len(), path);
-			tiles.extend(new_tiles);
-			if images.is_empty() {
-				*columns = image.width() / tile_size.x;
-			}
-			images.push(image);
-		},
-		Err(e) => _ = MessageDialog::new()
-			.set_parent(window)
-			.set_title("Error")
-			.set_description(format!("Failed to open file: {}", e))
-			.show(),
-	}
-}
-
-fn save(window: &Window, tiles: &[Tile], images: &[RgbaImage], tile_size: UVec2, columns: u32, path: PathBuf) {
-	let image_size = uvec2(columns, (tiles.len() as u32 + columns - 1) / columns) * tile_size;
-	let mut output_image = RgbaImage::new(image_size.x, image_size.y);
-	for (index, tile) in tiles.iter().enumerate() {
-		if let Some(TileData { image_index, tile_index }) = tile.get() {
-			let image = &images[image_index];
-			let src_pos = grid_pos(image.width() / tile_size.x, tile_index) * tile_size;
-			let src = *image.view(src_pos.x, src_pos.y, tile_size.x, tile_size.y);
-			let dest_pos = grid_pos(columns, index as u32) * tile_size;
-			output_image.copy_from(&src, dest_pos.x, dest_pos.y).expect("copy tile");
-		}
-	}
-	if let Err(e) = output_image.save(&path) {
-		MessageDialog::new()
-			.set_parent(window)
-			.set_title("Error")
-			.set_description(format!("Failed to save file: {}", e))
-			.show();
-	}
-}
-
-enum Direction { Up, Left, Down, Right }
-
-fn direction(
-	select_index: &mut u32,
-	select_box: &mut UVec2,
-	scroll_offset: &mut IVec2,
-	window_size: UVec2,
-	tile_size: UVec2,
-	columns: u32,
-	grabbed: bool,
-	shift: bool,
-	dir: Direction,
-) {
-	if !shift && !grabbed {
-		*select_box = DEFAULT_BOX;
-	}
-	let bound = match dir {
-		Direction::Up => *select_index >= columns,
-		Direction::Left => *select_index % columns > 0,
-		Direction::Down => true,
-		Direction::Right => (*select_index + select_box.x - 1) % columns < columns - 1,
-	};
-	if bound {
-		if shift {
-			if !grabbed {
-				match dir {
-					Direction::Up => {
-						*select_index -= columns;
-						select_box.y += 1;
-					},
-					Direction::Left => {
-						*select_index -= 1;
-						select_box.x += 1;
-					},
-					Direction::Down => select_box.y += 1,
-					Direction::Right => select_box.x += 1,
-				}
+	
+	fn tile_checked(&mut self, pos: UVec2) -> Option<&mut u16> {
+		let index = self.index(pos);
+		if index < self.num_tiles.val as usize {
+			match &mut self.tiles.val[index] {
+				&mut NULL_TILE => None,
+				tile => Some(tile),
 			}
 		} else {
-			match dir {
-				Direction::Up => *select_index -= columns,
-				Direction::Left => *select_index -= 1,
-				Direction::Down => *select_index += columns,
-				Direction::Right => *select_index += 1,
+			None
+		}
+	}
+	
+	fn selection(&self) -> (UVec2, UVec2, usize, usize) {
+		let min = self.select_pos1.val.min(self.select_pos2.val);
+		let max = self.select_pos1.val.max(self.select_pos2.val);
+		let size = max - min + 1;
+		let start = self.index(min);
+		let end = self.index(max) + 1;
+		(min, size, start, end)
+	}
+	
+	fn rotate(&mut self, offset: UVec2, size: UVec2, pos: UVec2, dir: usize) {
+		let indices = [
+			self.index(offset + pos),
+			self.index(offset + uvec2(size.x - pos.y - 1, pos.x)),
+			self.index(offset + uvec2(size.x - pos.x - 1, size.y - pos.y - 1)),
+			self.index(offset + uvec2(pos.y, size.y - pos.x - 1)),
+		];
+		self.tiles.val.swap(indices[0], indices[1]);
+		self.tiles.val.swap(indices[2], indices[3]);
+		self.tiles.val.swap(indices[dir], indices[dir + 2]);
+	}
+	
+	fn update_num_tiles(&mut self, queue: &Queue, mut end: usize) {
+		if end as u32 >= self.num_tiles.val {
+			while end != 0 && self.tiles.val[end - 1] == NULL_TILE {
+				end -= 1;
+			}
+			self.num_tiles.set_write(queue, end as u32);
+		}
+	}
+}
+
+enum State {
+	Split(Split),
+	Tiles(Tiles),
+}
+
+struct LoadedImage {
+	window_size_buffer: Buffer,
+	offset: BufferVal<IVec2>,
+	tile_size: BufferVal<UVec2>,
+	mouse_pos: DVec2,
+	pan: Option<DVec2>,
+	state: State,
+}
+
+struct Tiler {
+	modifers: ModifiersState,
+	file_dialog: FileDialog,
+	error: Option<String>,
+	square: Buffer,
+	split_pal: PipelineAndLayout,
+	tiles_pal: PipelineAndLayout,
+	select_pal: PipelineAndLayout,
+	pulled_pal: PipelineAndLayout,
+	loaded_image: Option<LoadedImage>,
+}
+
+fn load_image(
+	window_size: UVec2,
+	device: &Device,
+	queue: &Queue,
+	split_bind_group_layout: &BindGroupLayout,
+	image: RgbaImage,
+) -> LoadedImage {
+	let image_size = image.size();
+	let window_size_buffer = make::buffer(device, window_size.as_bytes(), WRITABLE_UNIFORM);
+	let offset = BufferVal::new(device, ivec2((window_size.x as i32 - image_size.x as i32) / 2, 0));
+	let tile_size = BufferVal::new(device, UVec2::splat(DEFAULT_TILE_SIZE).min(image_size));
+	let grid_size = BufferVal::new(device, image_size / tile_size.val);
+	let grid_offset = BufferVal::new(device, UVec2::ZERO);
+	let gap = BufferVal::new(device, UVec2::ZERO);
+	let split_bind_group = make::bind_group(device, split_bind_group_layout, vec![
+		make::buffer(device, image_size.as_bytes(), BufferUsages::UNIFORM).as_entire_binding(),
+		window_size_buffer.as_entire_binding(),
+		offset.entry(),
+		tile_size.entry(),
+		grid_size.entry(),
+		grid_offset.entry(),
+		gap.entry(),
+		BindingResource::TextureView(&make::texture_view(device, queue, image_size, 1, &image)),
+	]);
+	LoadedImage {
+		window_size_buffer,
+		offset,
+		tile_size,
+		mouse_pos: DVec2::ZERO,
+		pan: None,
+		state: State::Split(Split { image, grid_size, grid_offset, gap, split_bind_group }),
+	}
+}
+
+fn drag_value(ui: &mut egui::Ui, val: &mut u32, bounds: RangeInclusive<u32>, label: &str) -> bool {
+	ui.add(egui::DragValue::new(val).clamp_range(bounds).prefix(label)).changed()
+}
+
+fn drag_value_xy(ui: &mut egui::Ui, val: &mut UVec2, lower: u32, upper: UVec2) -> bool {
+	drag_value(ui, &mut val.x, lower..=upper.x, "X: ") |
+	drag_value(ui, &mut val.y, lower..=upper.y, "Y: ")
+}
+
+fn unique_tile(tiles: &[SubImage<&RgbaImage>], tile: &SubImage<&RgbaImage>) -> bool {
+	tiles
+		.iter()
+		.all(|existing_tile| existing_tile.pixels_only().zip(tile.pixels_only()).any(|(a, b)| a != b))
+}
+
+fn interesting_tile(tile: &SubImage<&RgbaImage>) -> bool {
+	let first_pixel = tile.get_pixel(0, 0);
+	tile.pixels_only().any(|pixel| pixel[3] != 0) && (
+		tile.dimensions() == (1, 1) || tile.pixels_only().any(|pixel| pixel != first_pixel)
+	)
+}
+
+fn split_param(
+	queue: &Queue,
+	ui: &mut egui::Ui,
+	label: &str,
+	buffer_val: &mut BufferVal<UVec2>,
+	lower: u32,
+	upper: UVec2,
+) {
+	ui.horizontal(|ui| {
+		ui.label(label);
+		if drag_value_xy(ui, &mut buffer_val.val, lower, upper) {
+			buffer_val.write(queue);
+		}
+	});
+}
+
+fn split_window(
+	queue: &Queue,
+	ctx: &egui::Context,
+	tile_size: &mut BufferVal<UVec2>,
+	image_size: UVec2,
+	grid_size: &mut BufferVal<UVec2>,
+	grid_offset: &mut BufferVal<UVec2>,
+	gap: &mut BufferVal<UVec2>,
+) -> bool {
+	window(ctx, "Split Tiles", |ui| {
+		split_param(queue, ui, "Tile Size", tile_size, 1,
+			(image_size - grid_offset.val - (grid_size.val - 1) * gap.val) / grid_size.val,
+		);
+		split_param(queue, ui, "Grid Size", grid_size, 1,
+			(image_size - grid_offset.val + gap.val) / (tile_size.val + gap.val),
+		);
+		split_param(queue, ui, "Offset", grid_offset, 0,
+			image_size - (grid_size.val - 1) * gap.val - grid_size.val * tile_size.val,
+		);
+		split_param(queue, ui, "Gap", gap, 0,
+			(image_size - grid_offset.val - grid_size.val * tile_size.val) /
+			UVec2::ONE.max(grid_size.val - 1),
+		);
+		ui.button("Ok").clicked()
+	})
+}
+
+fn columns_window(ctx: &egui::Context, columns: &mut u32, pad: &mut bool) -> Option<bool> {
+	window(ctx, "Columns", |ui| {
+		drag_value(ui, columns, 1..=1000, "");
+		ui.checkbox(pad, "Maintain tile positions");
+		match ui.horizontal(|ui| (ui.button("Ok").clicked(), ui.button("Cancel").clicked())).inner {
+			(true, _) => Some(true),
+			(_, true) => Some(false),
+			_ => None,
+		}
+	})
+}
+
+fn pad_columns(
+	new_columns: u32, old_columns: u32, tiles: &[u16; MAX_TILES], num_tiles: u32,
+) -> (Box<[u16; MAX_TILES]>, u32) {
+	let mut new_tiles = vec![NULL_TILE; MAX_TILES];
+	let mut new_index = 0;
+	let mut old_index = 0;
+	if new_columns > old_columns {
+		loop {
+			if (new_index % new_columns) < old_columns {
+				new_tiles[new_index as usize] = tiles[old_index as usize];
+				old_index += 1;
+				new_index += 1;
+				if old_index == num_tiles {
+					break;
+				}
+			} else {
+				new_index += 1;
+			}
+		}
+	} else {
+		let mut outside = vec![];
+		loop {
+			if (old_index % old_columns) < new_columns {
+				new_tiles[new_index as usize] = tiles[old_index as usize];
+				new_index += 1;
+			} else {
+				match tiles[old_index as usize] {
+					NULL_TILE => {},
+					tile => outside.push(tile),
+				}
+			}
+			old_index += 1;
+			if old_index == num_tiles {
+				break;
+			}
+		}
+		for tile in outside {
+			new_tiles[new_index as usize] = tile;
+			new_index += 1;
+		}
+	}
+	(new_tiles.into_boxed_slice().try_into().unwrap(), new_index)
+}
+
+fn split_image(
+	device: &Device,
+	queue: &Queue,
+	tiles_bind_group_layout: &BindGroupLayout,
+	select_bind_group_layout: &BindGroupLayout,
+	pulled_bind_group_layout: &BindGroupLayout,
+	window_size_buffer: &Buffer,
+	offset: &BufferVal<IVec2>,
+	tile_size: &BufferVal<UVec2>,
+	image: &RgbaImage,
+	grid_size: &BufferVal<UVec2>,
+	grid_offset: &BufferVal<UVec2>,
+	gap: &BufferVal<UVec2>,
+) -> State {
+	let mut tile_images = Vec::with_capacity(grid_size.val.element_product() as usize);
+	for grid_pos in RectIter::new(grid_size.val) {
+		let tile_pos = grid_offset.val + grid_pos * (tile_size.val + gap.val);
+		let image = image.view(tile_pos.x, tile_pos.y, tile_size.val.x, tile_size.val.y);
+		if interesting_tile(&image) && unique_tile(&tile_images, &image) {
+			tile_images.push(image);
+		}
+	}
+	let pixels = tile_images.iter().flat_map(|tile| tile.pixels_only()).collect::<Vec<_>>();
+	let columns = BufferVal::new(device, grid_size.val.x);
+	let select_pos1 = BufferVal::new(device, UVec2::ZERO);
+	let select_pos2 = BufferVal::new(device, UVec2::ZERO);
+	let num_tiles = BufferVal::new(device, tile_images.len() as u32);
+	let mut tile_indices = vec![NULL_TILE; MAX_TILES];
+	for i in 0..tile_images.len() {
+		tile_indices[i] = i as u16;
+	}
+	let tiles = tile_indices.into_boxed_slice().try_into().unwrap();
+	let tiles = BufferVal::new(device, tiles);
+	let pulled_tiles = vec![NULL_TILE; MAX_TILES].into_boxed_slice().try_into().unwrap();
+	let pulled_tiles = BufferVal::new(device, pulled_tiles);
+	let pulled_size = BufferVal::new(device, UVec2::ZERO);
+	let tile_images = make::texture_view(
+		device, queue, tile_size.val, tile_images.len() as u32, pixels.as_bytes(),
+	);
+	let tiles_bind_group = make::bind_group(device, tiles_bind_group_layout, vec![
+		window_size_buffer.as_entire_binding(),
+		offset.entry(),
+		tile_size.entry(),
+		columns.entry(),
+		num_tiles.entry(),
+		tiles.entry(),
+		BindingResource::TextureView(&tile_images),
+	]);
+	let select_bind_group = make::bind_group(device, select_bind_group_layout, vec![
+		window_size_buffer.as_entire_binding(),
+		offset.entry(),
+		tile_size.entry(),
+		select_pos1.entry(),
+		select_pos2.entry(),
+	]);
+	let pulled_bind_group = make::bind_group(device, pulled_bind_group_layout, vec![
+		window_size_buffer.as_entire_binding(),
+		tile_size.entry(),
+		pulled_size.entry(),
+		pulled_tiles.entry(),
+		BindingResource::TextureView(&tile_images),
+	]);
+	State::Tiles(Tiles {
+		pixels,
+		columns,
+		select_pos1,
+		select_pos2,
+		num_tiles,
+		tiles,
+		pulled_tiles,
+		pulled_size,
+		tiles_bind_group,
+		select_bind_group,
+		pulled_bind_group,
+		columns_dialog: None,
+	})
+}
+
+macro_rules! image_fields {
+	($key:pat, $($field:ident),*) => {
+		(Some(LoadedImage { $($field,)* .. }), _, ElementState::Pressed, $key)
+	};
+}
+
+macro_rules! tiles_fields {
+	($key:pat, $($field:ident),* $(,)?) => {
+		(
+			Some(LoadedImage { state: State::Tiles(Tiles { $($field,)* .. }), .. }),
+			_,
+			ElementState::Pressed,
+			$key,
+		)
+	};
+}
+
+macro_rules! tiles {
+	($key:pat, $tiles:ident) => {
+		(
+			Some(LoadedImage { state: State::Tiles($tiles), .. }),
+			_,
+			ElementState::Pressed,
+			$key,
+		)
+	};
+}
+
+fn up(v: &mut UVec2) {
+	v.y -= 1;
+}
+
+fn left(v: &mut UVec2) {
+	v.x -= 1;
+}
+
+fn down(v: &mut UVec2) {
+	v.y += 1;
+}
+
+fn right(v: &mut UVec2) {
+	v.x += 1;
+}
+
+impl Gui for Tiler {
+	fn resize(&mut self, window_size: UVec2, queue: &Queue) {
+		if let Some(LoadedImage { window_size_buffer, .. }) = &self.loaded_image {
+			queue.write_buffer(window_size_buffer, 0, window_size.as_bytes());
+		}
+	}
+	
+	fn modifiers(&mut self, modifers: ModifiersState) {
+		self.modifers = modifers;
+	}
+	
+	fn key(
+		&mut self,
+		window_size: UVec2,
+		queue: &Queue,
+		target: &EventLoopWindowTarget<()>,
+		keycode: KeyCode,
+		state: ElementState,
+	) {
+		match (&mut self.loaded_image, self.modifers, state, keycode) {
+			(_, _, ElementState::Pressed, KeyCode::Escape) => target.exit(),
+			(_, ModifiersState::CONTROL, ElementState::Pressed, KeyCode::KeyO) => {
+				self.file_dialog.select_file();
+			},
+			image_fields!(KeyCode::KeyR, offset, tile_size, state) => {
+				let content_width = match state {
+					State::Split(Split { image, .. }) => image.width(),
+					State::Tiles(Tiles { columns, .. }) => columns.val * tile_size.val.x,
+				} as i32;
+				offset.set_write(queue, ivec2((window_size.x as i32 - content_width) / 2, 0));
+			},
+			tiles_fields!(KeyCode::KeyC, columns, columns_dialog) => {
+				*columns_dialog = Some(ColumnsDialog { new_columns: columns.val, pad: false });
+			},
+			tiles_fields!(
+				KeyCode::ArrowUp | KeyCode::KeyW, select_pos1, select_pos2, pulled_size
+			) => {
+				if select_pos2.val.y > 0 {
+					select_pos2.modify_write(queue, up);
+					if pulled_size.val.element_product() != 0 {
+						select_pos1.modify_write(queue, up);
+					} else if !self.modifers.shift_key() {
+						select_pos1.set_write(queue, select_pos2.val);
+					}
+				}
+			},
+			tiles_fields!(
+				KeyCode::ArrowLeft | KeyCode::KeyA, select_pos1, select_pos2, pulled_size,
+			) => {
+				if select_pos2.val.x > 0 {
+					select_pos2.modify_write(queue, left);
+					if pulled_size.val.element_product() != 0 {
+						select_pos1.modify_write(queue, left)
+					} else if !self.modifers.shift_key() {
+						select_pos1.set_write(queue, select_pos2.val);
+					}
+				}
+			},
+			tiles_fields!(
+				KeyCode::ArrowDown | KeyCode::KeyS, select_pos1, select_pos2, pulled_size,
+			) => {
+				select_pos2.modify_write(queue, down);
+				if pulled_size.val.element_product() != 0 {
+					select_pos1.modify_write(queue, down);
+				} else if !self.modifers.shift_key() {
+					select_pos1.set_write(queue, select_pos2.val);
+				}
+			},
+			tiles_fields!(
+				KeyCode::ArrowRight | KeyCode::KeyD, select_pos1, select_pos2, columns, pulled_size,
+			) => {
+				if select_pos2.val.x < columns.val - 1 {
+					select_pos2.modify_write(queue, right);
+					if pulled_size.val.element_product() != 0 {
+						select_pos1.modify_write(queue, right);
+					} else if !self.modifers.shift_key() {
+						select_pos1.set_write(queue, select_pos2.val);
+					}
+				}
+			},
+			tiles!(KeyCode::KeyQ, tiles) => {
+				let (offset, size, start, end) = tiles.selection();
+				for pos in RectIter::new(size) {
+					if let Some(tile) = tiles.tile_checked(offset + pos) {
+						*tile = ((*tile >> 14) * 3 + 2) % 5 << 14 | *tile & 0x3FFF ^ 0x2000;
+					}
+				}
+				if size.x == size.y && self.modifers.control_key() {
+					for pos in RectIter::new(uvec2(size.x / 2 + size.x % 2, size.y / 2)) {
+						tiles.rotate(offset, size, pos, ROTATE_CCW);
+					}
+					tiles.update_num_tiles(queue, end);
+				}
+				tiles.tiles.write_range(queue, start, end);
+			},
+			tiles!(KeyCode::KeyE, tiles) => {
+				let (offset, size, start, end) = tiles.selection();
+				for pos in RectIter::new(size) {
+					if let Some(tile) = tiles.tile_checked(offset + pos) {
+						*tile = ((*tile >> 14) * 2 + 1) % 5 << 14 | *tile & 0x3FFF ^ 0x2000;
+					}
+				}
+				if size.x == size.y && self.modifers.control_key() {
+					for pos in RectIter::new(uvec2(size.x / 2 + size.x % 2, size.y / 2)) {
+						tiles.rotate(offset, size, pos, ROTATE_CW);
+					}
+					tiles.update_num_tiles(queue, end);
+				}
+				tiles.tiles.write_range(queue, start, end);
+			},
+			tiles!(KeyCode::KeyF, tiles) => {
+				let (offset, size, start, end) = tiles.selection();
+				for pos in RectIter::new(size) {
+					if let Some(tile) = tiles.tile_checked(offset + pos) {
+						*tile ^= 0x4000 << self.modifers.shift_key() as u8 as u16;
+					}
+				}
+				if self.modifers.control_key() {
+					let axis = UVec2::AXES[self.modifers.shift_key() as u8 as usize];
+					for pos in RectIter::new(size * (2 - axis) / 2) {
+						let a = tiles.index(offset + pos);
+						let b = tiles.index(offset + (size - pos - 1) * axis + (1 - axis) * pos);
+						tiles.tiles.val.swap(a, b);
+					}
+					tiles.update_num_tiles(queue, end);
+				}
+				tiles.tiles.write_range(queue, start, end);
+			},
+			tiles!(KeyCode::Space | KeyCode::Enter | KeyCode::NumpadEnter, tiles) => {
+				let (offset, size, start, end) = tiles.selection();
+				let pull = RectIter::new(size)
+					.map(|pos| offset + pos)
+					.filter(|&pos| tiles.tile_checked(pos).is_some())
+					.fold(None, |min_max, pos| match min_max {
+						None => Some((pos, pos)),
+						Some((min, max)) => Some((min.min(pos), max.max(pos))),
+					})
+					.map(|(min, max)| (
+						min,
+						max,
+						RectIter::new(max - min + 1)
+							.map(|pos| *tiles.tile_unchecked(min + pos))
+							.collect::<Vec<_>>(),
+					));
+				if tiles.pulled_size.val.element_product() == 0 {
+					for pos in RectIter::new(size) {
+						*tiles.tile_unchecked(offset + pos) = NULL_TILE;
+					}
+				} else if tiles.pulled_size.val == size {
+					for (index, pos) in RectIter::new(size).enumerate() {
+						*tiles.tile_unchecked(offset + pos) = tiles.pulled_tiles.val[index];
+					}
+				} else {
+					panic!("pulled size not zero and not equal to selection size");
+				}
+				tiles.update_num_tiles(queue, end);
+				tiles.tiles.write_range(queue, start, end);
+				match pull {
+					None => tiles.pulled_size.set_write(queue, UVec2::ZERO),
+					Some((min, max, pulled_tiles)) => {
+						tiles.pulled_tiles.val[..pulled_tiles.len()].copy_from_slice(&pulled_tiles);
+						tiles.pulled_tiles.write_range(queue, 0, pulled_tiles.len());
+						tiles.pulled_size.set_write(queue, max - min + 1);
+						tiles.select_pos1.set_write(queue, min);
+						tiles.select_pos2.set_write(queue, max);
+					},
+				}
+			},
+			_ => {},
+		}
+	}
+	
+	fn mouse_button(&mut self, button: MouseButton, state: ElementState) {
+		match (&mut self.loaded_image, state, button) {
+			(
+				Some(LoadedImage { pan, mouse_pos, .. }),
+				ElementState::Pressed,
+				MouseButton::Middle,
+			) => *pan = Some(*mouse_pos),
+			(
+				Some(LoadedImage { pan, .. }),
+				ElementState::Released,
+				MouseButton::Middle,
+			) => *pan = None,
+			_ => {},
+		}
+	}
+	
+	fn mouse_moved(&mut self, queue: &Queue, position: DVec2) {
+		if let Some(LoadedImage { offset, mouse_pos, pan, .. }) = &mut self.loaded_image {
+			*mouse_pos = position;
+			if let Some(pan) = pan {
+				offset.val += (position - *pan).as_ivec2();
+				offset.write(queue);
+				*pan = position;
 			}
 		}
 	}
-	let offset = *scroll_offset + ivec2((window_size.x - (columns * tile_size.x)) as i32 / 2, 0);
-	let select_min = offset.wrapping_add_unsigned(grid_pos(columns, *select_index) * tile_size) - 2;
-	let select_max = select_min.wrapping_add_unsigned(*select_box * tile_size) + 4;
-	let max_out = select_max - window_size.as_ivec2();
-	match dir {
-		Direction::Up => if select_min.y < 0 {
-			scroll_offset.y -= select_min.y;
-		},
-		Direction::Left => if select_min.x < 0 {
-			scroll_offset.x -= select_min.x;
-		},
-		Direction::Down => if max_out.y > 0 {
-			scroll_offset.y -= max_out.y;
-		},
-		Direction::Right => if max_out.x > 0 {
-			scroll_offset.x -= max_out.x;
-		},
+	
+	fn mouse_wheel(&mut self, queue: &Queue, delta: MouseScrollDelta) {
+		if let Some(LoadedImage { offset, tile_size, .. }) = &mut self.loaded_image {
+			let delta = match delta {
+				MouseScrollDelta::LineDelta(x, y) => (
+					if self.modifers.shift_key() {
+						vec2(y, x)
+					} else {
+						vec2(x, y)
+					} * tile_size.val.as_vec2()
+				).as_ivec2(),
+				MouseScrollDelta::PixelDelta(delta) => delta.to_vec().as_ivec2(),
+			};
+			offset.val += delta;
+			offset.write(queue);
+		}
+	}
+	
+	fn render(&mut self, encoder: &mut CommandEncoder, view: &TextureView) {
+		match &self.loaded_image {
+			Some(LoadedImage { state: State::Split(Split { split_bind_group, .. }), .. }) => {
+				let mut rpass = make::render_pass(encoder, view);
+				rpass.set_vertex_buffer(0, self.square.slice(..));
+				rpass.set_pipeline(&self.split_pal.pipeline);
+				rpass.set_bind_group(0, split_bind_group, &[]);
+				rpass.draw(0..SQUARE_VERTS, 0..1);
+			},
+			Some(LoadedImage { state: State::Tiles(Tiles {
+				tiles_bind_group, select_bind_group, pulled_bind_group, pulled_size, ..
+			}), .. }) => {
+				let mut rpass = make::render_pass(encoder, view);
+				rpass.set_vertex_buffer(0, self.square.slice(..));
+				rpass.set_pipeline(&self.tiles_pal.pipeline);
+				rpass.set_bind_group(0, tiles_bind_group, &[]);
+				rpass.draw(0..SQUARE_VERTS, 0..1);
+				rpass.set_pipeline(&self.select_pal.pipeline);
+				rpass.set_bind_group(0, select_bind_group, &[]);
+				rpass.draw(0..SQUARE_VERTS, 0..1);
+				if pulled_size.val.element_product() != 0 {
+					rpass.set_pipeline(&self.pulled_pal.pipeline);
+					rpass.set_bind_group(0, pulled_bind_group, &[]);
+					rpass.draw(0..SQUARE_VERTS, 0..1);
+				}
+			},
+			_ => {},
+		}
+	}
+	
+	fn egui(&mut self, window_size: UVec2, device: &Device, queue: &Queue, ctx: &egui::Context) {
+		self.file_dialog.update(ctx);
+		if let Some(path) = self.file_dialog.take_selected() {
+			match image::open(path) {
+				Ok(image) => self.loaded_image = Some(load_image(
+					window_size, device, queue, &self.split_pal.layout, image.to_rgba8(),
+				)),
+				Err(e) => self.error = Some(e.to_string()),
+			}
+		}
+		match &mut self.loaded_image {
+			Some(LoadedImage { window_size_buffer, offset, tile_size, state, .. }) => {
+				match state {
+					State::Split(Split { image, grid_size, grid_offset, gap, .. }) => {
+						if split_window(
+							queue, ctx, tile_size, image.size(), grid_size, grid_offset, gap,
+						) {
+							*state = split_image(
+								device,
+								queue,
+								&self.tiles_pal.layout,
+								&self.select_pal.layout,
+								&self.pulled_pal.layout,
+								window_size_buffer,
+								offset,
+								tile_size, 
+								image, 
+								grid_size,
+								grid_offset,
+								gap,
+							);
+						}
+					},
+					State::Tiles(Tiles { columns, num_tiles, tiles, columns_dialog, .. }) => {
+						if let Some(ColumnsDialog { new_columns, pad }) = columns_dialog {
+							if let Some(change_columns) = columns_window(ctx, new_columns, pad) {
+								if change_columns && *new_columns != columns.val {
+									if *pad {
+										let (new_tiles, new_num_tiles) = pad_columns(
+											*new_columns, columns.val, &tiles.val, num_tiles.val,
+										);
+										tiles.set_write(queue, new_tiles);
+										num_tiles.set_write(queue, new_num_tiles);
+									}
+									columns.set_write(queue, *new_columns);
+								}
+								*columns_dialog = None;
+							}
+						}
+					},
+				}
+			},
+			None => {
+				egui::panel::CentralPanel::default().show(ctx, |ui| {
+					ui.centered_and_justified(|ui| {
+						ui.label("Ctrl+O to open file");
+					});
+				});
+			},
+		}
+		if let Some(error) = &self.error {
+			if window(ctx, "Error", |ui| {
+				ui.label(error);
+				ui.button("OK").clicked()
+			}) {
+				self.error = None;
+			}
+		}
 	}
 }
 
-fn parse_args(window: &Window, tiles: &mut Vec<Tile>, images: &mut Vec<RgbaImage>, mut tile_size: UVec2) -> (UVec2, u32) {
-	let mut args = args().skip(1).peekable();
-	if let Some(arg) = args.peek() {
-		if let Ok(ts) = arg.parse::<u32>() {
-			tile_size = UVec2::splat(ts);
-			args.next();
-		}
+fn make_tiler(device: &Device) -> Tiler {
+	let split_pal = PipelineAndLayout::new(device, include_str!("shader/split.wgsl"), vec![
+		make::uniform_layout_entry::<UVec2>(ShaderStages::VERTEX),//image size
+		make::uniform_layout_entry::<UVec2>(ShaderStages::VERTEX),//window size
+		make::uniform_layout_entry::<IVec2>(ShaderStages::VERTEX),//offset
+		make::uniform_layout_entry::<UVec2>(ShaderStages::FRAGMENT),//tile size
+		make::uniform_layout_entry::<UVec2>(ShaderStages::FRAGMENT),//grid size
+		make::uniform_layout_entry::<UVec2>(ShaderStages::FRAGMENT),//grid offset
+		make::uniform_layout_entry::<UVec2>(ShaderStages::FRAGMENT),//gap
+		make::texture_layout_entry(TextureViewDimension::D2),//image
+	]);
+	let tiles_pal = PipelineAndLayout::new(device, include_str!("shader/tiles.wgsl"), vec![
+		make::uniform_layout_entry::<UVec2>(ShaderStages::VERTEX),//window size
+		make::uniform_layout_entry::<UVec2>(ShaderStages::VERTEX),//offset
+		make::uniform_layout_entry::<UVec2>(ShaderStages::VERTEX_FRAGMENT),//tile size
+		make::uniform_layout_entry::<u32>(ShaderStages::VERTEX_FRAGMENT),//columns
+		make::uniform_layout_entry::<u32>(ShaderStages::VERTEX_FRAGMENT),//num tiles
+		make::uniform_layout_entry::<[u16; MAX_TILES]>(ShaderStages::FRAGMENT),//tiles
+		make::texture_layout_entry(TextureViewDimension::D2Array),//tile images
+	]);
+	let select_pal = PipelineAndLayout::new(device, include_str!("shader/select.wgsl"), vec![
+		make::uniform_layout_entry::<UVec2>(ShaderStages::VERTEX),//window size
+		make::uniform_layout_entry::<IVec2>(ShaderStages::VERTEX),//offset
+		make::uniform_layout_entry::<UVec2>(ShaderStages::VERTEX),//tile size
+		make::uniform_layout_entry::<UVec2>(ShaderStages::VERTEX),//select pos
+		make::uniform_layout_entry::<UVec2>(ShaderStages::VERTEX),//select size
+	]);
+	let pulled_pal = PipelineAndLayout::new(device, include_str!("shader/pulled.wgsl"), vec![
+		make::uniform_layout_entry::<UVec2>(ShaderStages::VERTEX),//window size
+		make::uniform_layout_entry::<UVec2>(ShaderStages::VERTEX_FRAGMENT),//tile size
+		make::uniform_layout_entry::<UVec2>(ShaderStages::VERTEX_FRAGMENT),//pulled size
+		make::uniform_layout_entry::<[u16; MAX_TILES]>(ShaderStages::VERTEX_FRAGMENT),//tiles
+		make::texture_layout_entry(TextureViewDimension::D2Array),//tile images
+	]);
+	Tiler {
+		modifers: ModifiersState::empty(),
+		file_dialog: FileDialog::new(),
+		error: None,
+		square: make::buffer(device, SQUARE.as_bytes(), BufferUsages::VERTEX),
+		split_pal,
+		tiles_pal,
+		select_pal,
+		pulled_pal,
+		loaded_image: None,
 	}
-	if let Some(arg) = args.peek() {
-		if let Ok(ts_y) = arg.parse::<u32>() {
-			tile_size.y = ts_y;
-			args.next();
-		}
-	}
-	let tile_size = if tile_size.cmpeq(UVec2::ZERO).any() {
-		println!("tile size cannot be 0, using default");
-		UVec2::splat(DEFAULT_TILE_SIZE)
-	} else {
-		tile_size
-	};
-	let mut columns = DEFAULT_COLUMNS;
-	for arg in args {
-		open(&window, tiles, images, &mut columns, tile_size, arg);
-	}
-	(tile_size, columns)
-}
-
-fn read_next_u32(source: &str, pos: &mut usize) -> Option<u32> {
-	let mut start = None;
-	while *pos < source.len() {
-		if source.as_bytes()[*pos].is_ascii_digit() {
-			start = Some(*pos);
-			break;
-		}
-		*pos += 1;
-	}
-	let start = start?;
-	let mut end = None;
-	while *pos < source.len() {
-		if !source.as_bytes()[*pos].is_ascii_digit() {
-			end = Some(*pos);
-			break;
-		}
-		*pos += 1;
-	}
-	match end {
-		Some(end) => &source[start..end],
-		None => &source[start..],
-	}.parse().ok()
-}
-
-fn read_tile_size() -> UVec2 {
-	let mut tile_size = UVec2::splat(DEFAULT_TILE_SIZE);
-	if let Ok(file) = fs::read_to_string("tile_size") {
-		let mut pos = 0;
-		if let Some(ts) = read_next_u32(&file, &mut pos) {
-			tile_size = UVec2::splat(ts);
-		}
-		if let Some(ts_y) = read_next_u32(&file, &mut pos) {
-			tile_size.y = ts_y;
-		}
-	}
-	tile_size
-}
-
-fn get_tile_size(window: &Window, tiles: &mut Vec<Tile>, images: &mut Vec<RgbaImage>) -> (UVec2, u32) {
-	parse_args(&window, tiles, images, read_tile_size())
 }
 
 fn main() {
-	let event_loop = EventLoop::new().expect("build event loop");
-	let window = WindowBuilder::new()
-		.with_title("Tiler")
-		.with_min_inner_size(PhysicalSize::new(1, 1))
-		.build(&event_loop)
-		.expect("build window");
-	let context = Context::new(&window).expect("new context");
-	let mut surface = Surface::new(&context, &window).expect("new surface");
-	let window_size = window.inner_size();
-	resize(&mut surface, window_size);
-	let mut buffer = surface.buffer_mut().expect("init get buffer");
-	buffer.fill(0);
-	buffer.present().expect("init present");
-	
-	let mut window_size = to_vec(window_size);
-	let mut scroll_offset = DEFAULT_OFFSET;
-	let mut tiles = Vec::<Tile>::new();
-	let mut images = Vec::<RgbaImage>::new();
-	let mut key_modifiers = ModifiersState::empty();
-	let mut keys = Keys::new();
-	let mut select_index = 0;
-	let mut select_box = DEFAULT_BOX;
-	let mut grabbed_tiles = Option::<Vec::<Tile>>::None;
-	
-	let (tile_size, mut columns) = get_tile_size(&window, &mut tiles, &mut images);
-	
-	event_loop.run(|event, target| match event {
-		Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => target.exit(),
-		Event::WindowEvent { event: WindowEvent::ModifiersChanged(modifiers), .. } => key_modifiers = modifiers.state(),
-		Event::WindowEvent { event: WindowEvent::Resized(new_size), .. } => {
-			resize(&mut surface, new_size);
-			window_size = to_vec(new_size);
-		},
-		Event::WindowEvent { event: WindowEvent::MouseWheel { delta: MouseScrollDelta::LineDelta(x, y), .. }, .. } => {
-			let delta = if key_modifiers.shift_key() { vec2(y, x) } else { vec2(x, y) };
-			scroll_offset += (delta * tile_size.as_vec2()).as_ivec2();
-			window.request_redraw();
-		},
-		Event::WindowEvent { event: WindowEvent::MouseWheel { delta: MouseScrollDelta::PixelDelta(PhysicalPosition { x, y }), .. }, .. } => {
-			scroll_offset -= dvec2(x, y).as_ivec2();
-			window.request_redraw();
-		},
-		Event::WindowEvent { event: WindowEvent::KeyboardInput { event: KeyEvent { physical_key: PhysicalKey::Code(keycode), state, .. }, .. }, .. } => if keys.just_pressed(keycode, state) {
-			if key_modifiers.control_key() {
-				match keycode {
-					KeyCode::KeyO => if let Some(paths) = FileDialog::new().set_parent(&window).pick_files() {
-						for path in paths {
-							open(&window, &mut tiles, &mut images, &mut columns, tile_size, path);
-						}
-					},
-					KeyCode::KeyS => if !tiles.is_empty() {
-						if let Some(path) = FileDialog::new().set_parent(&window).save_file() {
-							save(&window, &tiles, &images, tile_size, columns, path);
-						}
-					},
-					_ => {},
-				}
-			} else {
-				match keycode {
-					KeyCode::KeyW | KeyCode::ArrowUp => direction(&mut select_index, &mut select_box, &mut scroll_offset, window_size, tile_size, columns, grabbed_tiles.is_some(), key_modifiers.shift_key(), Direction::Up),
-					KeyCode::KeyA | KeyCode::ArrowLeft => direction(&mut select_index, &mut select_box, &mut scroll_offset, window_size, tile_size, columns, grabbed_tiles.is_some(), key_modifiers.shift_key(), Direction::Left),
-					KeyCode::KeyS | KeyCode::ArrowDown => direction(&mut select_index, &mut select_box, &mut scroll_offset, window_size, tile_size, columns, grabbed_tiles.is_some(), key_modifiers.shift_key(), Direction::Down),
-					KeyCode::KeyD | KeyCode::ArrowRight => direction(&mut select_index, &mut select_box, &mut scroll_offset, window_size, tile_size, columns, grabbed_tiles.is_some(), key_modifiers.shift_key(), Direction::Right),
-					KeyCode::KeyZ => if columns > select_index % columns + select_box.x {
-						columns -= 1;
-					},
-					KeyCode::KeyX => columns += 1,
-					KeyCode::KeyR => scroll_offset = DEFAULT_OFFSET,
-					KeyCode::Delete | KeyCode::Backspace => grabbed_tiles = None,
-					KeyCode::Space | KeyCode::Enter | KeyCode::NumpadEnter => if !tiles.is_empty() {
-						let max_index = select_index + (select_box.x - 1) + (select_box.y - 1) * columns;
-						let extra = max_index as isize - tiles.len() as isize + 1;
-						if extra > 0 {
-							tiles.reserve(extra as usize);
-							for _ in 0..extra {
-								tiles.push(Tile::null());
-							}
-						}
-						let grabbed_tile_vec = match &mut grabbed_tiles {
-							Some(grabbed_tile_vec) => {
-								for grab_index in 0..select_box.element_product() {
-									let tile_index = select_index + (grab_index % select_box.x) + (grab_index / select_box.x) * columns;
-									swap(&mut grabbed_tile_vec[grab_index as usize], &mut tiles[tile_index as usize]);
-								}
-								grabbed_tile_vec
-							},
-							None => {
-								let grab_len = select_box.element_product();
-								let mut grabbed_tile_vec = Vec::with_capacity(grab_len as usize);
-								for grab_index in 0..grab_len {
-									let tile_index = select_index + (grab_index % select_box.x) + (grab_index / select_box.x) * columns;
-									grabbed_tile_vec.push(replace(&mut tiles[tile_index as usize], Tile::null()));
-								}
-								grabbed_tiles.insert(grabbed_tile_vec)
-							},
-						};
-						while !grabbed_tile_vec.is_empty() && grabbed_tile_vec[grabbed_tile_vec.len() - select_box.x as usize..].iter().all(|t| t.get().is_none()) {
-							grabbed_tile_vec.truncate(grabbed_tile_vec.len() - select_box.x as usize);
-							select_box.y -= 1;
-						}
-						while !grabbed_tile_vec.is_empty() && grabbed_tile_vec[..select_box.x as usize].iter().all(|t| t.get().is_none()) {
-							grabbed_tile_vec.drain(..select_box.x as usize);
-							select_box.y -= 1;
-						}
-						while !grabbed_tile_vec.is_empty() && (0..select_box.y).all(|y| grabbed_tile_vec[(y * select_box.x) as usize].get().is_none()) {
-							for y in (0..select_box.y).rev() {
-								grabbed_tile_vec.remove((y * select_box.x) as usize);
-							}
-							select_box.x -= 1;
-						}
-						while !grabbed_tile_vec.is_empty() && (0..select_box.y).all(|y| grabbed_tile_vec[((y + 1) * select_box.x) as usize - 1].get().is_none()) {
-							for y in (0..select_box.y).rev() {
-								grabbed_tile_vec.remove(((y + 1) * select_box.x) as usize - 1);
-							}
-							select_box.x -= 1;
-						}
-						if grabbed_tile_vec.is_empty() {
-							grabbed_tiles = None;
-							select_box = DEFAULT_BOX;
-						}
-						while let Some(true) = tiles.last().map(|t| t.get().is_none()) {
-							tiles.pop();
-						}
-					},
-					_ => {},
-				}
-			};
-			window.request_redraw();
-		},
-		Event::WindowEvent { event: WindowEvent::RedrawRequested, .. } => {
-			let mut buffer = surface.buffer_mut().expect("get buffer");
-			let mut frame = FrameBuffer::new(&mut buffer, window_size);
-			frame.fill();
-			let offset = scroll_offset + ivec2((window_size.x - (columns * tile_size.x)) as i32 / 2, 0);
-			for (index, tile) in tiles.iter().enumerate() {
-				if let Some(TileData { image_index, tile_index }) = tile.get() {
-					let image = &images[image_index];
-					let src_pos = grid_pos(image.width() / tile_size.x, tile_index) * tile_size;
-					let dest_pos = offset.wrapping_add_unsigned(grid_pos(columns, index as u32) * tile_size);
-					frame.draw_image(dest_pos, image.view(src_pos.x, src_pos.y, tile_size.x, tile_size.y));
-				}
-			}
-			if !tiles.is_empty() {
-				let select_pos = offset.wrapping_add_unsigned(grid_pos(columns, select_index) * tile_size);
-				let select_size = select_box * tile_size;
-				frame.draw_rect(select_pos - 1, select_size + 2);
-				frame.draw_rect(select_pos - 2, select_size + 4);
-			}
-			if let Some(grabbed_tile_vec) = &grabbed_tiles {
-				for (grabbed_tile_index, tile) in grabbed_tile_vec.iter().enumerate() {
-					if let Some(TileData { image_index, tile_index }) = tile.get() {
-						let image = &images[image_index];
-						let src_pos = grid_pos(image.width() / tile_size.x, tile_index) * tile_size;
-						let dest_pos = grid_pos(select_box.x, grabbed_tile_index as u32) * tile_size + 2;
-						frame.draw_image(dest_pos.as_ivec2(), image.view(src_pos.x, src_pos.y, tile_size.x, tile_size.y));
-					}
-				}
-				let grab_box = select_box * tile_size;
-				frame.draw_rect(IVec2::ZERO, grab_box + 4);
-				frame.draw_rect(IVec2::splat(1), grab_box + 2);
-			}
-			buffer.present().expect("present");
-		},
-		_ => {},
-	}).expect("run event loop");
+	gui::run("Tiler", make_tiler);
 }

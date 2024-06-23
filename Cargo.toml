@@ -1,12 +1,20 @@
 [package]
-name = "tiler"
+name = "tiler_g"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-anyhow = "1.0.82"
+arrayvec = "0.7.4"
+bitfield = "0.15.0"
+egui = "0.26.2"
+egui-file-dialog = "0.4.0"
+egui-wgpu = "0.26.2"
+egui-winit = "0.26.2"
+env_logger = "0.11.1"
 glam = "0.27.0"
-image = "0.25.1"
-rfd = "0.14.1"
+image = "0.24.9"
+pollster = "0.3.0"
+reinterpret = { git = "https://github.com/Ababwa/reinterpret.git" }
 softbuffer = "0.4.1"
-winit = "0.29.15"
+wgpu = "0.19.1"
+winit = "0.29.10"
