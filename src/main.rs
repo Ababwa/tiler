@@ -17,7 +17,8 @@ use wgpu::{
 	TextureViewDescriptor, TextureViewDimension,
 };
 use winit::{
-	event::{ElementState, MouseButton, MouseScrollDelta}, event_loop::EventLoopWindowTarget, keyboard::{KeyCode, ModifiersState}, window::Icon
+	event::{ElementState, MouseButton, MouseScrollDelta}, event_loop::EventLoopWindowTarget,
+	keyboard::{KeyCode, ModifiersState}, window::Icon,
 };
 use gui::Gui;
 use ext::{AsBytes, IterPixels, Size, ToVec};
