@@ -15,7 +15,7 @@ fn vs_main(@location(0) vert: vec2u) -> VertexOutput {
 	var select_min = min(select_pos1, select_pos2);
 	var region_size = (max(select_pos1, select_pos2) - select_min + 1) * tile_size;
 	var region_uv = vert * region_size;
-	var pos = vec2f((vec2i(region_uv + select_min * tile_size) + offset) * 2) / vec2f(window_size);
+	var pos = vec2f((vec2i(region_uv + select_min * tile_size) - offset) * 2) / vec2f(window_size);
 	return VertexOutput(vec4f(pos.x - 1, 1 - pos.y, 0, 1), vec2f(region_uv), region_size);
 }
 

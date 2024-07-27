@@ -10,7 +10,7 @@ struct VertexOutput {
 @vertex
 fn vs_main(@location(0) vert: vec2u) -> VertexOutput {
 	var uv = vert * image_size;
-	var pos = vec2f((vec2i(uv) + image_offset) * 2) / vec2f(window_size);
+	var pos = vec2f((vec2i(uv) - image_offset) * 2) / vec2f(window_size);
 	return VertexOutput(vec4f(pos.x - 1, 1 - pos.y, 0, 1), vec2f(uv));
 }
 

@@ -43,12 +43,12 @@ impl Size for RgbaImage {
 	}
 }
 
-pub trait PixelsOnly {
-	fn pixels_only(&self) -> impl Iterator<Item = Rgba<u8>>;
+pub trait IterPixels {
+	fn iter_pixels(&self) -> impl Iterator<Item = Rgba<u8>>;
 }
 
-impl PixelsOnly for SubImage<&RgbaImage> {
-	fn pixels_only(&self) -> impl Iterator<Item = Rgba<u8>> {
+impl IterPixels for SubImage<&RgbaImage> {
+	fn iter_pixels(&self) -> impl Iterator<Item = Rgba<u8>> {
 		self.pixels().map(|(_, _, pixel)| pixel)
 	}
 }

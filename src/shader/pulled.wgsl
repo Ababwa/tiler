@@ -15,7 +15,7 @@ fn vs_main(@location(0) vert: vec2u) -> VertexOutput {
 }
 
 //same as tiles.wgsl
-@group(0) @binding(3) var<uniform> tiles: array<vec4<u32>, 128>;
+@group(0) @binding(3) var<uniform> tiles: array<vec4u, 128>;
 @group(0) @binding(4) var tile_array: texture_2d_array<f32>;
 
 @fragment
