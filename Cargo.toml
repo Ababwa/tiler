@@ -1,5 +1,5 @@
 [package]
-name = "tiler_g"
+name = "tiler"
 version = "1.0.0"
 edition = "2021"
 
@@ -18,3 +18,6 @@ reinterpret = { git = "https://github.com/Ababwa/reinterpret.git" }
 softbuffer = "0.4.1"
 wgpu = "0.19.1"
 winit = "0.29.10"
+
+[build-dependencies]
+winresource = "0.1.17"
