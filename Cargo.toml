@@ -4,8 +4,6 @@ version = "1.0.0"
 edition = "2021"
 
 [dependencies]
-arrayvec = "0.7.4"
-bitfield = "0.15.0"
 egui = "0.26.2"
 egui-file-dialog = "0.4.0"
 egui-wgpu = "0.26.2"
