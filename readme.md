@@ -21,5 +21,8 @@ Blank and redundant tiles will be removed. Arrange tiles as desired. Save to ima
 * Delete or backspace to delete pulled tiles
 * C to set number of columns
 * R to center image in window
+* Mouse wheel to scroll vertically
+* Shift+mouse wheel to scroll horizontally
+* Drag middle mouse button to pan
 * Ctrl+S to save
 * Escape to quit
