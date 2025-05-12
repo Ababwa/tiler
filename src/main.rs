@@ -395,7 +395,7 @@ fn first_split(
 		tile_refs[i] = i as u16;
 	}
 	let pulled_tiles = vec![NULL_TILE; MAX_TILES];
-	let tiles = make::bindable_texture_view(device, queue, tile_size.val, num_tiles, pixels.as_bytes());
+	let tiles = make::bindable_texture_view(device, queue, tile_size.val, num_tiles, pixels[..].as_bytes());
 	let tile_refs = BufferVal::new(device, tile_refs.into_boxed_slice().try_into().unwrap());
 	let pulled_tiles = BufferVal::new(device, pulled_tiles.into_boxed_slice().try_into().unwrap());
 	let pulled_size = BufferVal::new(device, UVec2::ZERO);
@@ -484,7 +484,7 @@ fn next_split(
 	let new_num_tile_refs = num_tile_refs.val + num_new_tiles;
 	tile_refs.write_range(queue, old_num_tile_refs, new_num_tile_refs as usize);
 	num_tile_refs.set_write(queue, new_num_tile_refs);
-	let tiles = make::bindable_texture_view(device, queue, tile_size.val, num_tiles, pixels.as_bytes());
+	let tiles = make::bindable_texture_view(device, queue, tile_size.val, num_tiles, pixels[..].as_bytes());
 	*tiles_bind_group = make::bind_group(
 		device,
 		tiles_layout,

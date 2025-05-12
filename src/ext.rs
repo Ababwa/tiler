@@ -1,5 +1,5 @@
-use std::future::Future;
-use glam::{DVec2, IVec2, UVec2};
+use std::{future::Future, slice};
+use glam::{DVec2, UVec2};
 use image::{Rgba, RgbaImage, SubImage, GenericImageView};
 use pollster::block_on;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
@@ -57,36 +57,10 @@ pub trait AsBytes {
 	fn as_bytes(&self) -> &[u8];
 }
 
-impl<T: AsBytes> AsBytes for [T] {
+impl<T: ?Sized> AsBytes for T {
 	fn as_bytes(&self) -> &[u8] {
-		unsafe { reinterpret::slice(self) }
-	}
-}
-
-impl<T: AsBytes, const N: usize> AsBytes for [T; N] {
-	fn as_bytes(&self) -> &[u8] {
-		unsafe { reinterpret::ref_to_slice(self) }
-	}
-}
-
-impl<T: AsBytes> AsBytes for Box<T> {
-	fn as_bytes(&self) -> &[u8] {
-		(self as &T).as_bytes()
-	}
-}
-
-macro_rules! impl_as_bytes {
-	($type:ty) => {
-		impl AsBytes for $type {
-			fn as_bytes(&self) -> &[u8] {
-				unsafe { reinterpret::ref_to_slice(self) }
-			}
+		unsafe {
+			slice::from_raw_parts(self as *const T as *const u8, size_of_val(self))
 		}
-	};
+	}
 }
-
-impl_as_bytes!(u16);
-impl_as_bytes!(u32);
-impl_as_bytes!(UVec2);
-impl_as_bytes!(IVec2);
-impl_as_bytes!(Rgba<u8>);

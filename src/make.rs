@@ -1,5 +1,5 @@
 use std::{mem::size_of, num::NonZeroU64};
-use glam::UVec2;
+use glam::{IVec2, UVec2};
 use wgpu::{
 	util::{BufferInitDescriptor, DeviceExt, TextureDataOrder},
 	BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry,
@@ -203,27 +203,47 @@ pub fn render_pass<'a>(encoder: &'a mut CommandEncoder, view: &'a TextureView, c
 	)
 }
 
+pub trait GetBytes {
+	fn get_bytes(&self) -> &[u8];
+}
+
+trait GetBytesDirect {}
+
+impl<T: GetBytesDirect> GetBytes for T {
+	fn get_bytes(&self) -> &[u8] {
+		self.as_bytes()
+	}
+}
+
+impl GetBytesDirect for u32 {}
+impl GetBytesDirect for UVec2 {}
+impl GetBytesDirect for IVec2 {}
+
+impl<T, const N: usize> GetBytes for Box<[T; N]> {
+	fn get_bytes(&self) -> &[u8] {
+		self.as_ref().as_bytes()
+	}
+}
+
 pub struct BufferVal<T> {
 	pub buffer: Buffer,
 	pub val: T,
 }
 
-impl<T> BufferVal<T> {
+impl<T: GetBytes> BufferVal<T> {
 	pub fn entry(&self) -> BindingResource {
 		self.buffer.as_entire_binding()
 	}
-}
-
-impl<T: AsBytes> BufferVal<T> {
+	
 	pub fn new(device: &Device, val: T) -> Self {
 		Self {
-			buffer: buffer(device, val.as_bytes(), BufferUsages::UNIFORM | BufferUsages::COPY_DST),
+			buffer: buffer(device, val.get_bytes(), BufferUsages::UNIFORM | BufferUsages::COPY_DST),
 			val,
 		}
 	}
 	
 	pub fn write(&self, queue: &Queue) {
-		queue.write_buffer(&self.buffer, 0, self.val.as_bytes());
+		queue.write_buffer(&self.buffer, 0, self.val.get_bytes());
 	}
 	
 	pub fn set_write(&mut self, queue: &Queue, val: T) {
@@ -237,12 +257,12 @@ impl<T: AsBytes> BufferVal<T> {
 	}
 }
 
-impl<T: AsBytes, const N: usize> BufferVal<Box<[T; N]>> {
+impl<T, const N: usize> BufferVal<Box<[T; N]>> {
 	pub fn write_range(&self, queue: &Queue, start: usize, end: usize) {
 		const ALIGN_4_MASK: usize = !3;
 		let byte_start = (start * size_of::<T>()) & ALIGN_4_MASK;
 		let byte_end = (end * size_of::<T>() + 3) & ALIGN_4_MASK;
-		let bytes = &self.val.as_bytes()[byte_start..byte_end];
+		let bytes = &self.val[..].as_bytes()[byte_start..byte_end];
 		queue.write_buffer(&self.buffer, byte_start as u64, bytes);
 	}
 }
